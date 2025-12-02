@@ -1,0 +1,100 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <time.h>
+
+#define TARGET 20
+#define PLAYERS 2
+
+typedef struct {
+    int scores[PLAYERS];
+    int turn;
+    int finished;
+} SharedData;
+
+int main() {
+    int pipes[PLAYERS][2];
+    pid_t pids[PLAYERS];
+    SharedData *shared;
+
+    // cria memória compartilhada
+    int fd = shm_open("/game", O_CREAT | O_RDWR, 0666);
+    ftruncate(fd, sizeof(SharedData));
+    shared = mmap(NULL, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    // inicializa dados
+    for (int i = 0; i < PLAYERS; i++) shared->scores[i] = 0;
+    shared->turn = 0;
+    shared->finished = 0;
+
+    // cria semáforos para controlar turnos
+    sem_t *sem_turn[PLAYERS];
+    for (int i = 0; i < PLAYERS; i++) {
+        char name[16];
+        sprintf(name, "/sem%d", i);
+        sem_turn[i] = sem_open(name, O_CREAT, 0666, 0);
+    }
+    sem_post(sem_turn[0]); // jogador 0 começa
+
+    srand(time(NULL));
+
+    // cria processos jogadores
+    for (int i = 0; i < PLAYERS; i++) {
+        pipe(pipes[i]);
+        pids[i] = fork();
+
+        if (pids[i] == 0) {
+            // processo filho (jogador)
+            close(pipes[i][0]); // fecha leitura
+            while (1) {
+                sem_wait(sem_turn[i]); // espera sua vez
+                if (shared->finished) break;
+
+                int move = rand() % 3 + 1;
+                write(pipes[i][1], &move, sizeof(int));
+            }
+            exit(0);
+        } else {
+            close(pipes[i][1]); // servidor fecha escrita
+        }
+    }
+
+    // servidor controla o jogo
+    while (!shared->finished) {
+        int id = shared->turn;
+        int move;
+        read(pipes[id][0], &move, sizeof(int));
+        shared->scores[id] += move;
+        printf("Jogador %d jogou +%d (total=%d)\n", id, move, shared->scores[id]);
+
+        if (shared->scores[id] >= TARGET) {
+            printf("Jogador %d venceu!\n", id);
+            shared->finished = 1;
+            break;
+        }
+
+        // passa vez ao próximo jogador
+        shared->turn = (id + 1) % PLAYERS;
+        sem_post(sem_turn[shared->turn]);
+    }
+
+    // encerra jogadores
+    for (int i = 0; i < PLAYERS; i++) {
+        kill(pids[i], SIGTERM);
+        wait(NULL);
+        char name[16];
+        sprintf(name, "/sem%d", i);
+        sem_close(sem_turn[i]);
+        sem_unlink(name);
+    }
+
+    munmap(shared, sizeof(SharedData));
+    shm_unlink("/game");
+
+    return 0;
+}
